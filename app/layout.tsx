@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "NPG Lite Firmware Flasher",
-  description: "Browser-based firmware flasher for Neuro PlayGround (NPG) Lite devices using Web Serial API",
+  title: "NeuroSync Firmware Flasher",
+  description: "Browser-based firmware flasher for biosignal devices using Web Serial API",
 };
 
 export default function RootLayout({
