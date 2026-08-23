@@ -1,0 +1,1707 @@
+'use client';
+
+import { useState, useRef, useEffect } from 'react';
+import { ESPLoader, Transport } from 'esptool-js';
+import { AppTour } from './components/AppTour';
+import { Bluetooth, Wifi, Usb, Loader2 } from 'lucide-react';
+
+// IndexedDB utility functions
+const DB_NAME = 'ESP32FlasherDB';
+const DB_VERSION = 2;
+const STORE_NAME = 'firmwares';
+
+// Cloudflare Worker proxy URL
+const CLOUDFLARE_WORKER_URL = 'https://npg-lite-web-flasher.myupsidedownlab.workers.dev/';
+
+// Default firmware files
+interface DefaultFirmware {
+  name: string;
+  description: string;
+  url: string;
+  type: 'ble' | 'wifi' | 'serial' | 'bootloader' | 'partition-table';
+}
+
+const DEFAULT_FIRMWARES: DefaultFirmware[] = [
+  {
+    name: 'npg-lite-ble.bin',
+    description: 'BLE Version - For Bluetooth Low Energy communication',
+    url: './firmwares/NPG-LITE-BLE.ino.bin',
+    type: 'ble'
+  },
+  {
+    name: 'npg-lite-wifi.bin',
+    description: 'WiFi Version - For WiFi communication',
+    url: './firmwares/NPG-LITE-WiFi.ino.bin',
+    type: 'wifi'
+  },
+  {
+    name: 'npg-lite-serial.bin',
+    description: 'Serial Version - For direct serial communication',
+    url: './firmwares/NPG-LITE.ino.bin',
+    type: 'serial'
+  },
+  {
+    name: 'bootloader.bin',
+    description: 'Bootloader - required for full/recovery flash',
+    url: './firmwares/bootloader.bin',
+    type: 'bootloader'
+  },
+  {
+    name: 'partition-table.bin',
+    description: 'Partition table - required for full/recovery flash',
+    url: './firmwares/partition-table.bin',
+    type: 'partition-table'
+  }
+];
+
+// Types that should never be user-deletable and never shown in the
+// selectable "app firmware" pickers (they are flashing components, not apps)
+const DEFAULT_TYPES = ['ble', 'wifi', 'serial', 'bootloader', 'partition-table'];
+
+const openDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      const oldVersion = event.oldVersion;
+
+      if (oldVersion < 2 && db.objectStoreNames.contains(STORE_NAME)) {
+        db.deleteObjectStore(STORE_NAME);
+      }
+
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        const store = db.createObjectStore(STORE_NAME, { keyPath: 'name' });
+        store.createIndex('timestamp', 'timestamp', { unique: false });
+        store.createIndex('size', 'size', { unique: false });
+        store.createIndex('type', 'type', { unique: false });
+      }
+    };
+  });
+};
+
+const saveFirmwareToDB = async (name: string, data: ArrayBuffer, type?: string): Promise<void> => {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+
+      const firmware = {
+        name,
+        data,
+        timestamp: Date.now(),
+        size: data.byteLength,
+        ...(type && { type })
+      };
+
+      const request = store.put(firmware);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  } catch (error) {
+    console.error('Database save error:', error);
+    try {
+      await resetDatabase();
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+
+        const firmware = {
+          name,
+          data,
+          timestamp: Date.now(),
+          size: data.byteLength,
+          ...(type && { type })
+        };
+
+        const request = store.put(firmware);
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve();
+      });
+    } catch (retryError: unknown) {
+      throw new Error('Failed to save firmware to storage. Please clear your browser cache and try again.');
+    }
+  }
+};
+
+const resetDatabase = async (): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(DB_NAME);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+    request.onblocked = () => {
+      console.warn('Database deletion blocked');
+      resolve();
+    };
+  });
+};
+
+const getFirmwareFromDB = async (name: string): Promise<ArrayBuffer | null> => {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+
+    const request = store.get(name);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      if (request.result) {
+        resolve(request.result.data);
+      } else {
+        resolve(null);
+      }
+    };
+  });
+};
+
+interface FirmwareInfo {
+  name: string;
+  size: number;
+  timestamp: number;
+  type?: string;
+  isDefault?: boolean;
+}
+
+const getAllFirmwaresFromDB = async (): Promise<FirmwareInfo[]> => {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+
+    const request = store.getAll();
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const items = request.result as Array<{
+        name: string;
+        size: number;
+        timestamp: number;
+        type?: string;
+        data: ArrayBuffer;
+      }>;
+
+      const firmwares: FirmwareInfo[] = items.map(item => ({
+        name: item.name,
+        size: item.size,
+        timestamp: item.timestamp,
+        type: item.type,
+        isDefault: item.type && DEFAULT_TYPES.includes(item.type) ? true : undefined
+      }));
+
+      resolve(firmwares);
+    };
+  });
+};
+
+const deleteFirmwareFromDB = async (name: string): Promise<void> => {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+
+    const request = store.delete(name);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve();
+  });
+};
+
+interface ExtendedESPLoader extends ESPLoader {
+  readMac?(): Promise<string>;
+  hardReset?(): Promise<void>;
+}
+
+interface GithubFirmware {
+  name: string;
+  url: string;
+}
+
+interface GithubAsset {
+  name: string;
+  browser_download_url: string;
+}
+
+interface GithubRelease {
+  assets: GithubAsset[];
+}
+
+// Fixed offsets used when flashing the complete firmware set
+const BOOTLOADER_ADDRESS = 0x0;
+const PARTITION_TABLE_ADDRESS = 0x8000;
+const APP_ADDRESS = 0x10000;
+
+export default function ESP32Flasher() {
+  const [isConnected, setIsConnected] = useState(false);
+  const [isFlashing, setIsFlashing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [firmwareFile, setFirmwareFile] = useState<File | null>(null);
+  const [chipInfo, setChipInfo] = useState<string>('');
+  const [flashAddress, setFlashAddress] = useState<string>('0x10000');
+  const [flashFullFirmware, setFlashFullFirmware] = useState(false);
+  // Explicit, mandatory selections for full-flash mode. All three must be
+  // set by the user (or picked from Local Firmwares) before flashing is
+  // allowed — nothing is auto-guessed by filename.
+  const [bootloaderFile, setBootloaderFile] = useState<File | null>(null);
+  const [partitionTableFile, setPartitionTableFile] = useState<File | null>(null);
+  const [showGithubDialog, setShowGithubDialog] = useState(false);
+  const [showAddFirmwareDialog, setShowAddFirmwareDialog] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [githubFirmwares, setGithubFirmwares] = useState<GithubFirmware[]>([]);
+  const [isFetchingGithub, setIsFetchingGithub] = useState(false);
+  const [downloadingFirmware, setDownloadingFirmware] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<string>('');
+  const [localFirmwares, setLocalFirmwares] = useState<FirmwareInfo[]>([]);
+  const [selectedDefaultFirmware, setSelectedDefaultFirmware] = useState<string>('');
+  const [isLoadingDefaults, setIsLoadingDefaults] = useState(false);
+
+  const transportRef = useRef<Transport | null>(null);
+  const espLoaderRef = useRef<ExtendedESPLoader | null>(null);
+  const serialPortRef = useRef<SerialPort | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const githubRepo = 'upsidedownlabs/npg-lite-firmware';
+  const lastLogRef = useRef<HTMLDivElement>(null);
+  const advancedButtonRef = useRef<HTMLButtonElement>(null);
+
+  const addLog = (message: string) => {
+    setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${message}`]);
+  };
+
+  useEffect(() => {
+    if (lastLogRef.current) {
+      lastLogRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs]);
+
+  const loadLocalFirmwares = async () => {
+    try {
+      const firmwares = await getAllFirmwaresFromDB();
+      setLocalFirmwares(firmwares);
+
+      // Check if default firmwares need to be loaded
+      await ensureDefaultFirmwares();
+    } catch (error) {
+      console.error('Error loading local firmwares:', error);
+    }
+  };
+
+  const ensureDefaultFirmwares = async () => {
+    setIsLoadingDefaults(true);
+    const existingFirmwares = await getAllFirmwaresFromDB();
+    const existingNames = existingFirmwares.map(f => f.name);
+
+    let loadedCount = 0;
+    for (const firmware of DEFAULT_FIRMWARES) {
+      if (!existingNames.includes(firmware.name)) {
+        try {
+          addLog(`Loading default ${firmware.type.toUpperCase()} firmware...`);
+          const response = await fetch(firmware.url);
+          if (response.ok) {
+            const arrayBuffer = await response.arrayBuffer();
+            await saveFirmwareToDB(firmware.name, arrayBuffer, firmware.type);
+            addLog(`✓ Added default ${firmware.type.toUpperCase()} firmware to storage`);
+            loadedCount++;
+          } else {
+            addLog(`⚠ Could not load default ${firmware.type.toUpperCase()} firmware`);
+          }
+        } catch (error) {
+          console.error(`Error loading default firmware ${firmware.name}:`, error);
+          addLog(`⚠ Could not load default ${firmware.type.toUpperCase()} firmware`);
+        }
+      }
+    }
+
+    // Reload firmwares after adding defaults
+    const updatedFirmwares = await getAllFirmwaresFromDB();
+    setLocalFirmwares(updatedFirmwares);
+
+    if (loadedCount > 0) {
+      addLog(`✓ Loaded ${loadedCount} default firmware(s)`);
+    }
+
+    setIsLoadingDefaults(false);
+  };
+
+  const loadDefaultFirmware = async (type: 'ble' | 'wifi' | 'serial') => {
+    // Block if flashing is in progress
+    if (isFlashing) return;
+
+    const firmwareInfo = DEFAULT_FIRMWARES.find(f => f.type === type);
+    if (!firmwareInfo) return;
+
+    setSelectedDefaultFirmware(type);
+
+    try {
+      addLog(`Selecting ${firmwareInfo.type.toUpperCase()} firmware...`);
+
+      // Check if already in storage
+      const existing = localFirmwares.find(f => f.name === firmwareInfo.name);
+      if (existing) {
+        const arrayBuffer = await getFirmwareFromDB(firmwareInfo.name);
+        if (arrayBuffer) {
+          const file = new File([arrayBuffer], firmwareInfo.name, { type: 'application/octet-stream' });
+          setFirmwareFile(file);
+          addLog(`✓ Selected ${firmwareInfo.type.toUpperCase()} firmware (${(arrayBuffer.byteLength / 1024).toFixed(2)} KB)`);
+        }
+      } else {
+        // Download and save
+        addLog(`Downloading ${firmwareInfo.type.toUpperCase()} firmware...`);
+        const response = await fetch(firmwareInfo.url);
+        if (response.ok) {
+          const arrayBuffer = await response.arrayBuffer();
+          const file = new File([arrayBuffer], firmwareInfo.name, { type: 'application/octet-stream' });
+          setFirmwareFile(file);
+          await saveFirmwareToDB(firmwareInfo.name, arrayBuffer, firmwareInfo.type);
+          await loadLocalFirmwares();
+          addLog(`✓ Downloaded and selected ${firmwareInfo.type.toUpperCase()} firmware (${(arrayBuffer.byteLength / 1024).toFixed(2)} KB)`);
+        } else {
+          addLog(`❌ Could not load ${firmwareInfo.type.toUpperCase()} firmware`);
+        }
+      }
+    } catch (error) {
+      addLog(`❌ Error loading ${firmwareInfo.type.toUpperCase()} firmware: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
+  useEffect(() => {
+    loadLocalFirmwares();
+  }, []);
+
+  // Prevent scrolling
+  useEffect(() => {
+    document.documentElement.style.overflow = 'hidden';
+    document.body.style.overflow = 'hidden';
+
+    return () => {
+      document.documentElement.style.overflow = '';
+      document.body.style.overflow = '';
+    };
+  }, []);
+
+  // Close advanced popup when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      const el = target instanceof Element ? target : (target as Node).parentElement;
+
+      if (
+        showAdvanced &&
+        advancedButtonRef.current &&
+        !advancedButtonRef.current.contains(target) &&
+        !(el instanceof Element && el.closest('.advanced-popup'))
+      ) {
+        setShowAdvanced(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [showAdvanced]);
+
+  const connectToDevice = async () => {
+    try {
+      // Check for Web Serial API support
+      const navigatorWithSerial = navigator as Navigator & { serial?: Serial };
+      if (!navigatorWithSerial.serial || typeof navigatorWithSerial.serial.requestPort !== 'function') {
+        addLog('❌ Web Serial API not supported. Use Chrome/Edge 89+ over HTTPS.');
+        return;
+      }
+
+      addLog('Requesting serial port access...');
+      const port = await navigatorWithSerial.serial.requestPort();
+      addLog('Connecting to ESP32...');
+
+      serialPortRef.current = port;
+      const transport = new Transport(port, true);
+      transportRef.current = transport;
+
+      const esploader = new ESPLoader({
+        transport,
+        baudrate: 921600,
+        romBaudrate: 115200,
+        terminal: {
+          clean: () => { },
+          writeLine: (data: string) => addLog(data),
+          write: (data: string) => addLog(data)
+        }
+      }) as ExtendedESPLoader;
+
+      espLoaderRef.current = esploader;
+      const chip = await esploader.main();
+
+      addLog(`Connected to ${chip}`);
+      setChipInfo(chip);
+      setIsConnected(true);
+
+      try {
+        const esploaderAny = esploader as unknown as { readMac?: () => Promise<string> };
+        if (typeof esploaderAny.readMac === 'function') {
+          const macAddr = await esploaderAny.readMac();
+          addLog(`MAC Address: ${macAddr}`);
+        }
+      } catch (e: unknown) {
+        // MAC read not critical
+        console.log('MAC address read failed:', e);
+      }
+
+    } catch (error: unknown) {
+      addLog(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      transportRef.current = null;
+      espLoaderRef.current = null;
+      serialPortRef.current = null;
+    }
+  };
+
+  const disconnectDevice = async () => {
+    try {
+      if (transportRef.current) {
+        await transportRef.current.disconnect();
+      }
+      if (serialPortRef.current && serialPortRef.current.readable) {
+        await serialPortRef.current.close();
+      }
+      addLog('Disconnected from device');
+    } catch (error: unknown) {
+      addLog(`Disconnect warning: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      serialPortRef.current = null;
+      transportRef.current = null;
+      espLoaderRef.current = null;
+      setIsConnected(false);
+      setChipInfo('');
+    }
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    // Block file upload if flashing is in progress
+    if (isFlashing) return;
+
+    const file = e.target.files?.[0];
+    if (file) {
+      if (file.name.endsWith('.bin')) {
+        setFirmwareFile(file);
+        addLog(`Selected firmware: ${file.name} (${(file.size / 1024).toFixed(2)} KB)`);
+        setShowAddFirmwareDialog(false);
+        setSelectedDefaultFirmware('');
+
+        // Save to local storage
+        file.arrayBuffer().then(arrayBuffer => {
+          saveFirmwareToDB(file.name, arrayBuffer).then(() => {
+            loadLocalFirmwares(); // Refresh the local firmwares list
+            addLog(`✓ Saved ${file.name} to local storage`);
+          }).catch((error: Error) => {
+            addLog(`⚠ Could not save to storage: ${error.message}`);
+          });
+        });
+      } else {
+        addLog('❌ Please select a .bin file');
+      }
+    }
+  };
+
+  const triggerFileInput = () => {
+    if (isFlashing) return;
+    fileInputRef.current?.click();
+  };
+
+  // ── Selection for the mandatory bootloader / partition-table slots ──
+  // These are chosen from Local Firmwares (populated only via "Add Firmware"
+  // or the default auto-downloads) — never a separate upload path.
+  const loadBootloaderFromStorage = async (name: string) => {
+    if (isFlashing) return;
+    if (!name) {
+      setBootloaderFile(null);
+      return;
+    }
+    try {
+      const arrayBuffer = await getFirmwareFromDB(name);
+      if (arrayBuffer) {
+        setBootloaderFile(new File([arrayBuffer], name, { type: 'application/octet-stream' }));
+        addLog(`✓ Bootloader set to ${name} (${(arrayBuffer.byteLength / 1024).toFixed(2)} KB)`);
+      } else {
+        addLog(`❌ Could not load ${name} from storage`);
+      }
+    } catch (error: unknown) {
+      addLog(`Error loading bootloader: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
+  const loadPartitionTableFromStorage = async (name: string) => {
+    if (isFlashing) return;
+    if (!name) {
+      setPartitionTableFile(null);
+      return;
+    }
+    try {
+      const arrayBuffer = await getFirmwareFromDB(name);
+      if (arrayBuffer) {
+        setPartitionTableFile(new File([arrayBuffer], name, { type: 'application/octet-stream' }));
+        addLog(`✓ Partition table set to ${name} (${(arrayBuffer.byteLength / 1024).toFixed(2)} KB)`);
+      } else {
+        addLog(`❌ Could not load ${name} from storage`);
+      }
+    } catch (error: unknown) {
+      addLog(`Error loading partition table: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
+  // Converts an ArrayBuffer into the binary-string format esptool-js expects
+  const arrayBufferToBinaryString = (buffer: ArrayBuffer): string =>
+    Array.from(new Uint8Array(buffer)).map(b => String.fromCharCode(b)).join('');
+
+  const flashFirmware = async () => {
+    if (!espLoaderRef.current) {
+      addLog('No device connected');
+      return;
+    }
+
+    // In full-flash mode, all three files are mandatory and must be
+    // explicitly selected by the user — no auto-lookup, no guessing by name.
+    if (flashFullFirmware) {
+      if (!bootloaderFile || !partitionTableFile || !firmwareFile) {
+        addLog('❌ Full flash requires all three files to be selected:');
+        addLog(`   Bootloader: ${bootloaderFile ? '✓ ' + bootloaderFile.name : '✗ not selected'}`);
+        addLog(`   Partition table: ${partitionTableFile ? '✓ ' + partitionTableFile.name : '✗ not selected'}`);
+        addLog(`   App: ${firmwareFile ? '✓ ' + firmwareFile.name : '✗ not selected'}`);
+        return;
+      }
+    } else if (!firmwareFile) {
+      addLog('No firmware file selected');
+      return;
+    }
+
+    let fileEntries: { data: string; address: number }[] = [];
+
+    try {
+      setIsFlashing(true);
+      setProgress(0);
+      addLog('Starting flash process...');
+
+      if (flashFullFirmware) {
+        // ── Full flash: bootloader + partition table + app ──
+        // At this point bootloaderFile, partitionTableFile, and firmwareFile
+        // are guaranteed non-null by the check above.
+        addLog('Full flash selected: writing bootloader + partition table + app');
+
+        const bootloaderBuf = await bootloaderFile!.arrayBuffer();
+        const partitionTableBuf = await partitionTableFile!.arrayBuffer();
+        const appBuf = await firmwareFile!.arrayBuffer();
+
+        fileEntries = [
+          { data: arrayBufferToBinaryString(bootloaderBuf), address: BOOTLOADER_ADDRESS },
+          { data: arrayBufferToBinaryString(partitionTableBuf), address: PARTITION_TABLE_ADDRESS },
+          { data: arrayBufferToBinaryString(appBuf), address: APP_ADDRESS },
+        ];
+
+        addLog(`Bootloader: ${bootloaderFile!.name} — ${(bootloaderBuf.byteLength / 1024).toFixed(2)} KB @ 0x0`);
+        addLog(`Partition table: ${partitionTableFile!.name} — ${(partitionTableBuf.byteLength / 1024).toFixed(2)} KB @ 0x8000`);
+        addLog(`App: ${firmwareFile!.name} — ${(appBuf.byteLength / 1024).toFixed(2)} KB @ 0x10000`);
+      } else {
+        // ── Default behavior: app only, at the configured address ──
+        const addrStr = flashAddress.trim();
+        const isValidAddr = /^0x[0-9a-fA-F]+$/.test(addrStr);
+        if (!isValidAddr) {
+          addLog('❌ Invalid flash address. Use hex like 0x10000');
+          setIsFlashing(false);
+          return;
+        }
+
+        const address = parseInt(addrStr, 16);
+
+        // Guard against accidentally overwriting the bootloader/partition
+        // table region when only flashing a single app binary.
+        if (address < PARTITION_TABLE_ADDRESS + 0x1000) {
+          addLog('❌ This address overlaps the bootloader/partition table region.');
+          addLog('   Enable "Flash complete firmware" to write all components safely,');
+          addLog('   or use an address of 0x10000 or higher for app-only flashing.');
+          setIsFlashing(false);
+          return;
+        }
+
+        const arrayBuffer = await firmwareFile!.arrayBuffer();
+        addLog(`File size: ${arrayBuffer.byteLength} bytes`);
+
+        fileEntries = [{
+          data: arrayBufferToBinaryString(arrayBuffer),
+          address
+        }];
+      }
+
+      const esploader = espLoaderRef.current;
+
+      addLog(`Writing ${fileEntries.length} file(s) to device...`);
+      setProgress(10);
+
+      // Byte-weighted progress tracking. esptool-js's reportProgress gives a
+      // (fileIndex, written, total) triple where written/total is the
+      // *current file's own* completion fraction — not a global one. Since
+      // the bootloader/partition-table/app files can differ hugely in size
+      // (the app is typically much larger), weighting every file as an
+      // equal 1/N share of the bar makes progress jump through small files
+      // and stall on the big one. Instead we weight each file's
+      // contribution by its share of total (uncompressed) bytes so the bar
+      // advances at a rate proportional to actual data written, whether
+      // this is a single-file app flash or a 3-file full flash.
+      const fileSizes = fileEntries.map(f => f.data.length);
+      const totalBytes = fileSizes.reduce((sum, size) => sum + size, 0);
+      const cumulativeBytes = fileSizes.reduce<number[]>((acc, size, i) => {
+        acc.push(i === 0 ? 0 : acc[i - 1] + fileSizes[i - 1]);
+        return acc;
+      }, []);
+
+      const esploaderAny = esploader as unknown as {
+        writeFlash: (options: {
+          fileArray: Array<{ data: string; address: number }>;
+          flashSize: string;
+          eraseAll: boolean;
+          compress: boolean;
+          flashMode: string;
+          flashFreq: string;
+          reportProgress: (fileIndex: number, written: number, total: number) => void;
+        }) => Promise<void>;
+      };
+
+      await esploaderAny.writeFlash({
+        fileArray: fileEntries,
+        flashSize: 'keep',
+        eraseAll: false,
+        compress: true,
+        flashMode: 'dio',
+        flashFreq: '40m',
+        reportProgress: (fileIndex: number, written: number, total: number) => {
+          const bytesDone = cumulativeBytes[fileIndex] + fileSizes[fileIndex] * (written / total);
+          const overallFraction = totalBytes > 0 ? bytesDone / totalBytes : 0;
+          setProgress(Math.round(10 + overallFraction * 90));
+        }
+      });
+
+      setProgress(100);
+      addLog('✅ Flash completed successfully!');
+      addLog('🔄 Finalizing flash process...');
+
+      try {
+        if (serialPortRef.current && 'setSignals' in serialPortRef.current) {
+          try {
+            addLog('Sending reset signals...');
+            const port = serialPortRef.current;
+            await port.setSignals({ dataTerminalReady: false, requestToSend: true });
+            await new Promise(resolve => setTimeout(resolve, 50));
+            await port.setSignals({ dataTerminalReady: true, requestToSend: false });
+            await new Promise(resolve => setTimeout(resolve, 50));
+          } catch (signalError: unknown) {
+            console.log('Signal error:', signalError);
+          }
+        }
+
+        if (transportRef.current) {
+          addLog('Closing transport...');
+          await transportRef.current.disconnect();
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        if (serialPortRef.current) {
+          addLog('Closing serial port...');
+          if (serialPortRef.current.readable) {
+            await serialPortRef.current.close();
+          }
+        }
+      } catch (cleanupError: unknown) {
+        console.log('Cleanup error:', cleanupError);
+        addLog('Cleanup completed with warnings');
+      }
+
+      transportRef.current = null;
+      espLoaderRef.current = null;
+      serialPortRef.current = null;
+      setIsConnected(false);
+      setChipInfo('');
+
+      addLog('');
+      addLog('🎊 FIRMWARE FLASH COMPLETE!');
+      addLog('📋 If device is not responding then follow these Steps:');
+      addLog('   1. ➡️  Press the RESET button on your ESP32-C6');
+      addLog('   2. ⏳  Wait 2-3 seconds');
+      addLog('   3. 🔵  Device will start with new firmware');
+      addLog('');
+      addLog('💡 Troubleshooting:');
+      addLog("   • If device doesn't respond: Power cycle USB");
+      addLog('   • To flash again: Click "Connect Device"');
+      addLog('   • Check device in Bluetooth settings');
+
+    } catch (error: unknown) {
+      addLog(`❌ Flash error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      console.error(error);
+
+      try {
+        if (transportRef.current) {
+          await transportRef.current.disconnect();
+        }
+        if (serialPortRef.current && serialPortRef.current.readable) {
+          await serialPortRef.current.close();
+        }
+      } catch (cleanupError: unknown) {
+        console.log('Cleanup error during flash failure:', cleanupError);
+      }
+
+      transportRef.current = null;
+      espLoaderRef.current = null;
+      serialPortRef.current = null;
+      setIsConnected(false);
+      setChipInfo('');
+    } finally {
+      setIsFlashing(false);
+    }
+  };
+
+  const clearLogs = () => {
+    setLogs([]);
+  };
+
+  const fetchGithubReleases = async () => {
+    // Block if flashing is in progress
+    if (isFlashing) return;
+
+    setIsFetchingGithub(true);
+    try {
+      addLog(`Fetching firmwares from GitHub: ${githubRepo}...`);
+      const apiUrl = `https://api.github.com/repos/${githubRepo}/releases/latest`;
+
+      let releasesData: GithubRelease | null = null;
+
+      try {
+        addLog('Trying GitHub API...');
+        const response = await fetch(apiUrl, {
+          headers: { 'Accept': 'application/vnd.github.v3+json' },
+          signal: AbortSignal.timeout(10000)
+        });
+
+        if (response.ok) {
+          releasesData = await response.json() as GithubRelease;
+          addLog('✓ Successfully fetched from GitHub API');
+        }
+      } catch (error: unknown) {
+        console.log('GitHub API fetch failed:', error);
+      }
+
+      if (!releasesData) {
+        const corsProxies = [
+          { name: 'allOrigins', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(apiUrl)}` },
+          { name: 'corsProxy', url: `https://corsproxy.io/?${encodeURIComponent(apiUrl)}` }
+        ];
+
+        for (const proxy of corsProxies) {
+          try {
+            addLog(`Trying ${proxy.name}...`);
+            const response = await fetch(proxy.url, {
+              headers: { 'Accept': 'application/vnd.github.v3+json' },
+              signal: AbortSignal.timeout(10000)
+            });
+
+            if (response.ok) {
+              releasesData = await response.json() as GithubRelease;
+              addLog(`✓ Successfully fetched via ${proxy.name}`);
+              break;
+            }
+          } catch (error: unknown) {
+            console.log(`Proxy ${proxy.name} failed:`, error);
+          }
+        }
+      }
+
+      if (!releasesData) {
+        throw new Error('Failed to fetch releases. Please check your internet connection or try again later.');
+      }
+
+      const assets = releasesData.assets || [];
+      const firmwares = assets
+        .filter((asset: GithubAsset) => asset.name.endsWith('.bin'))
+        .map((asset: GithubAsset) => ({
+          name: asset.name,
+          url: asset.browser_download_url,
+        }));
+
+      if (firmwares.length === 0) {
+        addLog('⚠ No .bin files found in the latest release');
+        return;
+      }
+
+      setGithubFirmwares(firmwares);
+      setShowGithubDialog(true);
+      addLog(`✓ Found ${firmwares.length} firmware(s) in latest release`);
+
+    } catch (error: unknown) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      addLog(`❌ Error: ${errorMsg}`);
+      addLog('\n💡 You can still flash firmware by:');
+      addLog('1. Downloading .bin files manually from GitHub');
+      addLog(`2. Visit: https://github.com/${githubRepo}/releases`);
+      addLog('3. Use "Add Firmware" button to upload them');
+    } finally {
+      setIsFetchingGithub(false);
+    }
+  };
+
+  // Download function using Cloudflare Worker proxy
+  const downloadGithubFirmware = async (url: string, name: string) => {
+    setDownloadingFirmware(name);
+    setDownloadProgress('Initializing...');
+    try {
+      addLog(`Downloading ${name}...`);
+
+      const commonHeaders = {
+        'Accept': 'application/octet-stream, */*',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      };
+
+      let arrayBuffer: ArrayBuffer | null = null;
+      let successMethod = '';
+
+      // Use Cloudflare Worker proxy
+      try {
+        setDownloadProgress('Downloading via Cloudflare Worker...');
+        addLog(`Downloading via Cloudflare Worker...`);
+
+        const response = await fetch(`${CLOUDFLARE_WORKER_URL}?url=${encodeURIComponent(url)}`, {
+          method: 'GET',
+          headers: commonHeaders,
+          signal: AbortSignal.timeout(30000),
+          mode: 'cors'
+        });
+
+        if (response.ok && response.status === 200) {
+          const contentType = response.headers.get('content-type');
+          if (contentType && contentType.includes('text/html')) {
+            addLog(`⚠ Worker: Got HTML response, skipping`);
+          } else {
+            setDownloadProgress(`Saving firmware data...`);
+            arrayBuffer = await response.arrayBuffer();
+
+            if (arrayBuffer.byteLength > 1000) {
+              successMethod = 'Cloudflare Worker';
+              addLog(`✓ Download successful via ${successMethod} (${(arrayBuffer.byteLength / 1024).toFixed(2)} KB)`);
+            } else {
+              addLog(`⚠ Worker: Response too small (${arrayBuffer.byteLength} bytes), may be invalid`);
+            }
+          }
+        } else {
+          addLog(`⚠ Worker responded with status: ${response.status}`);
+        }
+      } catch (error: unknown) {
+        console.log('Cloudflare Worker download failed:', error);
+        addLog(`⚠ Cloudflare Worker failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+
+      if (!arrayBuffer || arrayBuffer.byteLength < 1000) {
+        addLog(`❌ Download failed for ${name}`);
+        throw new Error(`Download failed. Please use manual download option.`);
+      }
+
+      setDownloadProgress('Saving to storage...');
+      addLog(`Saving to browser storage...`);
+      await saveFirmwareToDB(name, arrayBuffer);
+      await loadLocalFirmwares();
+
+      const file = new File([arrayBuffer], name, { type: 'application/octet-stream' });
+      setFirmwareFile(file);
+      setSelectedDefaultFirmware('');
+      setShowGithubDialog(false);
+      addLog(`✓ Successfully downloaded and saved ${name}`);
+      addLog(`✓ Ready to flash! Click "Flash Firmware" when device is connected.`);
+
+    } catch (error: unknown) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      addLog(`❌ Download error: ${errorMsg}`);
+      addLog(`\n🚀 Manual Download Instructions:`);
+      addLog(`   1. Visit: https://github.com/${githubRepo}/releases/latest`);
+      addLog(`   2. Find and click on "${name}"`);
+      addLog(`   3. Save the .bin file to your computer`);
+      addLog(`   4. Use "Add Firmware" button to upload it`);
+    } finally {
+      setDownloadingFirmware(null);
+      setDownloadProgress('');
+    }
+  };
+
+  const loadFirmwareFromStorage = async (name: string) => {
+    // Block if flashing is in progress
+    if (isFlashing) return;
+
+    try {
+      addLog(`Loading ${name} from storage...`);
+      const arrayBuffer = await getFirmwareFromDB(name);
+
+      if (arrayBuffer) {
+        const file = new File([arrayBuffer], name, { type: 'application/octet-stream' });
+        setFirmwareFile(file);
+        // Clear default selection if loading a custom firmware
+        const isDefault = DEFAULT_FIRMWARES.some(f => f.name === name);
+        setSelectedDefaultFirmware(isDefault ? DEFAULT_FIRMWARES.find(f => f.name === name)?.type || '' : '');
+        addLog(`✓ Loaded ${name} (${(arrayBuffer.byteLength / 1024).toFixed(2)} KB)`);
+      } else {
+        addLog(`❌ Firmware ${name} not found in storage`);
+      }
+    } catch (error: unknown) {
+      addLog(`Error loading firmware: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
+  const deleteFirmwareFromStorage = async (name: string) => {
+    // Block if flashing is in progress
+    if (isFlashing) return;
+
+    try {
+      // Check if it's a default firmware
+      const isDefault = DEFAULT_FIRMWARES.some(f => f.name === name);
+      if (isDefault) {
+        addLog(`⚠ Cannot delete default firmware: ${name}`);
+        return;
+      }
+
+      await deleteFirmwareFromDB(name);
+      await loadLocalFirmwares();
+      addLog(`Deleted ${name} from storage`);
+
+      if (firmwareFile && firmwareFile.name === name) {
+        setFirmwareFile(null);
+        setSelectedDefaultFirmware('');
+      }
+    } catch (error: unknown) {
+      addLog(`Error deleting firmware: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
+  const clearAllFirmwares = async () => {
+    // Block if flashing is in progress
+    if (isFlashing) return;
+
+    try {
+      if (confirm('Are you sure you want to delete all custom firmwares? Default firmwares will be preserved.')) {
+        addLog('Clearing all custom firmwares...');
+
+        // Get all firmwares and filter out defaults
+        const allFirmwares = await getAllFirmwaresFromDB();
+        const customFirmwares = allFirmwares.filter(f => !f.isDefault);
+
+        // Delete custom firmwares one by one
+        for (const firmware of customFirmwares) {
+          await deleteFirmwareFromDB(firmware.name);
+        }
+
+        await loadLocalFirmwares();
+
+        // Clear selection if it was a custom firmware
+        if (firmwareFile && !DEFAULT_FIRMWARES.some(f => f.name === firmwareFile.name)) {
+          setFirmwareFile(null);
+          setSelectedDefaultFirmware('');
+        }
+
+        addLog(`✓ Cleared ${customFirmwares.length} custom firmware(s) from storage`);
+      }
+    } catch (error: unknown) {
+      addLog(`Error clearing storage: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
+  // Derived: all interactive firmware controls should be locked while flashing
+  const firmwareControlsDisabled = isFlashing || isLoadingDefaults;
+
+  // Local firmwares shown in the "Local Firmwares" sidebar should exclude the
+  // bootloader/partition-table helper files — they aren't standalone app images.
+  const displayedLocalFirmwares = localFirmwares.filter(
+    f => f.type !== 'bootloader' && f.type !== 'partition-table'
+  );
+
+  return (
+    <div className="h-screen bg-gradient-to-br from-gray-900 via-blue-900 to-gray-900 p-4">
+      <div className="h-full flex flex-col lg:flex-row gap-4 max-w-8xl mx-auto">
+        {/* Main Content - Left Side */}
+        <div className="flex-1 flex flex-col lg:flex-row min-h-0 gap-4 ">
+          <div className="bg-gray-800 rounded-2xl shadow-2xl p-6 border border-gray-700 flex-1 flex flex-col min-h-0">
+            {/* Header */}
+            <div className="mb-2">
+              <h1 className="text-lg xl:text-3xl font-bold text-white ">Neuro PlayGround (NPG) Lite Firmware Flasher</h1>
+            </div>
+
+            {/* Connection Section */}
+            <div className="flex items-center gap-4 mb-2">
+              {!isConnected ? (
+                <button
+                  onClick={connectToDevice}
+                  disabled={isFlashing}
+                  className="connection-section px-6 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
+                >
+                  Connect Device
+                </button>
+              ) : (
+                <button
+                  onClick={disconnectDevice}
+                  disabled={isFlashing}
+                  className="px-6 py-3 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
+                >
+                  Disconnect
+                </button>
+              )}
+              {chipInfo && (
+                <div className="flex items-center gap-2">
+                  <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
+                  <span className="text-green-400 font-medium">{chipInfo} Connected</span>
+                </div>
+              )}
+            </div>
+
+            {/* Firmware Section */}
+            <div className="firmware-selection flex-1 flex flex-col overflow-y-auto min-h-0 custom-scrollbar pr-1">
+              <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 mb-4">
+                <h2 className="text-lg font-semibold text-white">Firmware Binary</h2>
+                <div className="flex gap-2">
+                  {/* ── ADD FIRMWARE button: disabled while flashing ── */}
+                  <button
+                    onClick={() => setShowAddFirmwareDialog(true)}
+                    disabled={isFlashing}
+                    className="add-firmware-btn flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:opacity-50 text-white rounded-lg text-sm transition-colors"
+                  >
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                    </svg>
+                    Add Firmware
+                  </button>
+
+                  {/* ── GET FROM GITHUB button: disabled while flashing ── */}
+                  <button
+                    onClick={fetchGithubReleases}
+                    disabled={isFetchingGithub || isFlashing}
+                    className="github-firmware-btn flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:opacity-50 text-white rounded-lg text-sm transition-colors"
+                  >
+                    {isFetchingGithub ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Loading...
+                      </>
+                    ) : (
+                      <>
+                        <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
+                          <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+                        </svg>
+                        Get from GitHub
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                {/* Default Firmware Selection */}
+                <div className="default-firmwares-section">
+                  <label className="block text-sm font-medium text-gray-300 mb-2">
+                    Pre-built Firmwares
+                    {isFlashing && (
+                      <span className="ml-2 text-xs text-yellow-400 font-normal">
+                        (locked during flash)
+                      </span>
+                    )}
+                  </label>
+                  <div className="grid grid-cols-3 gap-2 mb-4">
+                    {/* ── BLE button ── */}
+                    <button
+                      onClick={() => loadDefaultFirmware('ble')}
+                      disabled={firmwareControlsDisabled || selectedDefaultFirmware === 'ble'}
+                      className={`p-3 rounded-lg border transition-colors ${selectedDefaultFirmware === 'ble'
+                          ? 'bg-blue-600 border-blue-500 cursor-default'
+                          : firmwareControlsDisabled
+                            ? 'bg-gray-800 border-gray-700 cursor-not-allowed opacity-50'
+                            : 'bg-gray-900 border-gray-600 hover:bg-gray-700'
+                        }`}
+                    >
+                      <div className="flex flex-col items-center gap-1">
+                        {isLoadingDefaults ? (
+                          <Loader2 className="h-5 w-5 text-white animate-spin" />
+                        ) : (
+                          <Bluetooth className="h-5 w-5 text-white" />
+                        )}
+                        <span className="text-xs font-medium text-white">BLE</span>
+                        <span className="text-xs text-gray-300">Wireless</span>
+                        {isLoadingDefaults && (
+                          <span className="text-xs text-gray-400 mt-1">Loading...</span>
+                        )}
+                      </div>
+                    </button>
+
+                    {/* ── WiFi button ── */}
+                    <button
+                      onClick={() => loadDefaultFirmware('wifi')}
+                      disabled={firmwareControlsDisabled || selectedDefaultFirmware === 'wifi'}
+                      className={`p-3 rounded-lg border transition-colors ${selectedDefaultFirmware === 'wifi'
+                          ? 'bg-green-600 border-green-500 cursor-default'
+                          : firmwareControlsDisabled
+                            ? 'bg-gray-800 border-gray-700 cursor-not-allowed opacity-50'
+                            : 'bg-gray-900 border-gray-600 hover:bg-gray-700'
+                        }`}
+                    >
+                      <div className="flex flex-col items-center gap-1">
+                        {isLoadingDefaults ? (
+                          <Loader2 className="h-5 w-5 text-white animate-spin" />
+                        ) : (
+                          <Wifi className="h-5 w-5 text-white" />
+                        )}
+                        <span className="text-xs font-medium text-white">WiFi</span>
+                        <span className="text-xs text-gray-300">Wireless</span>
+                        {isLoadingDefaults && (
+                          <span className="text-xs text-gray-400 mt-1">Loading...</span>
+                        )}
+                      </div>
+                    </button>
+
+                    {/* ── Serial button ── */}
+                    <button
+                      onClick={() => loadDefaultFirmware('serial')}
+                      disabled={firmwareControlsDisabled || selectedDefaultFirmware === 'serial'}
+                      className={`p-3 rounded-lg border transition-colors ${selectedDefaultFirmware === 'serial'
+                          ? 'bg-purple-600 border-purple-500 cursor-default'
+                          : firmwareControlsDisabled
+                            ? 'bg-gray-800 border-gray-700 cursor-not-allowed opacity-50'
+                            : 'bg-gray-900 border-gray-600 hover:bg-gray-700'
+                        }`}
+                    >
+                      <div className="flex flex-col items-center gap-1">
+                        {isLoadingDefaults ? (
+                          <Loader2 className="h-5 w-5 text-white animate-spin" />
+                        ) : (
+                          <Usb className="h-5 w-5 text-white" />
+                        )}
+                        <span className="text-xs font-medium text-white">Serial</span>
+                        <span className="text-xs text-gray-300">Direct USB</span>
+                        {isLoadingDefaults && (
+                          <span className="text-xs text-gray-400 mt-1">Loading...</span>
+                        )}
+                      </div>
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-400 mb-4">
+                    Select a pre-built firmware version. These will be automatically downloaded and stored locally.
+                  </p>
+                </div>
+
+                {/* Selected Firmware Display (this is the App file — required in both modes) */}
+                <div className="selected-firmware-display">
+                  <label className="block text-sm font-medium text-gray-300 mb-2">
+                    {flashFullFirmware ? 'App Firmware (required)' : 'Selected Firmware'}
+                  </label>
+                  {firmwareFile ? (
+                    <div className="p-3 bg-gray-900 rounded-lg border border-green-500">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-green-400 font-medium">{firmwareFile.name}</p>
+                          <p className="text-gray-400 text-sm">{(firmwareFile.size / 1024).toFixed(2)} KB</p>
+                          {selectedDefaultFirmware && (
+                            <div className="flex items-center gap-1 mt-1">
+                              <span className="px-2 py-0.5 bg-blue-600 text-white rounded text-xs">
+                                {selectedDefaultFirmware.toUpperCase()}
+                              </span>
+                              <span className="text-xs text-gray-400">
+                                {DEFAULT_FIRMWARES.find(f => f.type === selectedDefaultFirmware)?.description}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        {/* ── Clear selection: disabled while flashing ── */}
+                        <button
+                          onClick={() => {
+                            if (isFlashing) return;
+                            setFirmwareFile(null);
+                            setSelectedDefaultFirmware('');
+                          }}
+                          disabled={isFlashing}
+                          className="text-red-400 hover:text-red-300 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-4 bg-gray-900 rounded-lg border border-gray-600 text-center">
+                      <p className="text-gray-400">No firmware selected</p>
+                      <p className="text-gray-500 text-sm mt-1">Select a pre-built version or add your own firmware</p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="full-flash-option flex items-start gap-3 p-3 bg-gray-900 rounded-lg border border-gray-700">
+                  <div className="relative flex items-center mt-0.5">
+                    <input
+                      type="checkbox"
+                      id="flashFullFirmware"
+                      checked={flashFullFirmware}
+                      onChange={(e) => setFlashFullFirmware(e.target.checked)}
+                      disabled={isFlashing}
+                      className="peer appearance-none h-5 w-5 shrink-0 rounded-md border-2 border-gray-500 bg-gray-800 
+                 checked:bg-green-600 checked:border-green-600 
+                 hover:border-gray-400 
+                 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 focus:ring-offset-gray-900
+                 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-gray-500
+                 transition-colors duration-150 cursor-pointer"
+                    />
+                    {/* checkmark, only visible when checked */}
+                    <svg
+                      className="pointer-events-none absolute h-3.5 w-3.5 left-[3px] top-[3px] text-white opacity-0 peer-checked:opacity-100 transition-opacity"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={3}
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                  </div>
+
+                  <label htmlFor="flashFullFirmware" className="text-sm text-gray-300 cursor-pointer">
+                    <span className="font-medium text-white">Flash complete firmware</span>
+                    <span className="block text-xs text-gray-400 mt-0.5">
+                      Writes bootloader + partition table + app. Use this for a new/blank chip or to recover a device
+                      that won&apos;t boot. Off by default — normal updates only need the app.
+                    </span>
+                  </label>
+                </div>
+                {/* Mandatory bootloader + partition table selection — chosen from
+                    Local Firmwares (added only via "Add Firmware" or the
+                    default auto-downloads). Only shown/required in full-flash mode. */}
+                {flashFullFirmware && (
+                  <div className="full-flash-required-files space-y-3">
+                    {/* Bootloader selector */}
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">
+                        Bootloader (required)
+                      </label>
+                      <select
+                        value={bootloaderFile?.name || ''}
+                        onChange={(e) => loadBootloaderFromStorage(e.target.value)}
+                        disabled={isFlashing}
+                        className={`w-full px-3 py-2 bg-gray-900 text-white rounded-lg border text-sm focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 ${bootloaderFile ? 'border-green-500' : 'border-yellow-600'
+                          }`}
+                      >
+                        <option value=""> Select from Local Firmwares </option>
+                        {localFirmwares.map((f) => (
+                          <option key={f.name} value={f.name}>
+                            {f.name} ({(f.size / 1024).toFixed(1)} KB)
+                          </option>
+                        ))}
+                      </select>
+                      {bootloaderFile && (
+                        <p className="text-xs text-green-400 mt-1">
+                          ✓ {bootloaderFile.name} ({(bootloaderFile.size / 1024).toFixed(2)} KB)
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Partition table selector */}
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">
+                        Partition Table (required)
+                      </label>
+                      <select
+                        value={partitionTableFile?.name || ''}
+                        onChange={(e) => loadPartitionTableFromStorage(e.target.value)}
+                        disabled={isFlashing}
+                        className={`w-full px-3 py-2 bg-gray-900 text-white rounded-lg border text-sm focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 ${partitionTableFile ? 'border-green-500' : 'border-yellow-600'
+                          }`}
+                      >
+                        <option value=""> Select from Local Firmwares </option>
+                        {localFirmwares.map((f) => (
+                          <option key={f.name} value={f.name}>
+                            {f.name} ({(f.size / 1024).toFixed(1)} KB)
+                          </option>
+                        ))}
+                      </select>
+                      {partitionTableFile && (
+                        <p className="text-xs text-green-400 mt-1">
+                          ✓ {partitionTableFile.name} ({(partitionTableFile.size / 1024).toFixed(2)} KB)
+                        </p>
+                      )}
+                    </div>
+
+                    {(!bootloaderFile || !partitionTableFile || !firmwareFile) && (
+                      <p className="text-xs text-yellow-400">
+                        All three (bootloader, partition table, app) must be selected before flashing. Don&apos;t see the
+                        file you need? Add it first with the &quot;Add Firmware&quot; button above.
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Advanced Options - Now as popup */}
+                <div className="flash-address-section relative">
+                  <button
+                    ref={advancedButtonRef}
+                    onClick={() => setShowAdvanced(!showAdvanced)}
+                    disabled={isFlashing || flashFullFirmware}
+                    className="flex items-center gap-2 text-sm font-medium text-gray-300 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <svg
+                      className={`h-4 w-4 transition-transform ${showAdvanced ? 'rotate-90' : ''}`}
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
+                    Advanced Option
+                  </button>
+
+                  {showAdvanced && !isFlashing && !flashFullFirmware && (
+                    <div className="advanced-popup absolute bottom-full left-0 mb-2 z-10 w-80 p-4 bg-gray-800 rounded-lg border border-gray-600 shadow-xl">
+                      <label className="block text-sm font-medium text-gray-300 mb-2">
+                        Flash Address (hex)
+                      </label>
+                      <input
+                        type="text"
+                        value={flashAddress}
+                        onChange={(e) => setFlashAddress(e.target.value)}
+                        placeholder="0x10000"
+                        className="w-full px-3 py-2 bg-gray-700 text-white rounded-lg border border-gray-600 focus:border-blue-500 focus:outline-none"
+                        disabled={isFlashing}
+                      />
+                      <p className="mt-2 text-xs text-gray-400">
+                        Default: 0x10000 (application partition)
+                      </p>
+                      <p className="mt-1 text-xs text-gray-500">
+                        Change only if you know what you&apos;re doing. Addresses below 0x9000 are blocked here —
+                        use &quot;Flash complete firmware&quot; instead if you need to write the bootloader/partition table.
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Flash Button */}
+                <button
+                  onClick={flashFirmware}
+                  disabled={
+                    !isConnected ||
+                    isFlashing ||
+                    (flashFullFirmware
+                      ? !bootloaderFile || !partitionTableFile || !firmwareFile
+                      : !firmwareFile)
+                  }
+                  className="flash-button w-full px-6 py-3 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
+                >
+                  {isFlashing ? 'Flashing...' : flashFullFirmware ? 'Flash Complete Firmware' : 'Flash Firmware'}
+                </button>
+              </div>
+              {/* Progress Bar */}
+              {isFlashing && (
+                <div className="progress-section mt-4">
+                  <div className="w-full bg-gray-600 rounded-full h-4 overflow-hidden">
+                    <div
+                      className="bg-green-500 h-full transition-all duration-300 flex items-center justify-center text-white text-xs font-semibold"
+                      style={{ width: `${progress}%` }}
+                    >
+                      {progress > 5 && `${progress}%`}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+          {/* Console Section - Middle */}
+          <div className="console-section w-full lg:w-70 xl:w-100 2xl:w-150 flex-shrink-0">
+            <div className="bg-gray-800 rounded-2xl shadow-2xl p-6 border border-gray-700 h-full flex flex-col">
+              {/* Console Logs */}
+              <div className="flex-1 min-h-0 flex flex-col">
+                <div className="flex justify-between items-center mb-3">
+                  <h2 className="text-lg font-semibold text-white">Console</h2>
+                  <button
+                    onClick={clearLogs}
+                    className="px-3 py-1 bg-gray-600 hover:bg-gray-500 text-white rounded text-sm transition-colors"
+                  >
+                    Clear
+                  </button>
+                </div>
+                <div className="bg-black rounded-lg p-3 flex-1 overflow-y-auto font-mono text-sm min-h-0 custom-scrollbar">
+                  {logs.map((log, index) => (
+                    <div
+                      key={index}
+                      ref={index === logs.length - 1 ? lastLogRef : null}
+                      className="text-green-400 mb-1 leading-relaxed"
+                    >
+                      {log}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Firmware Sidebar - Right Side */}
+          <div className="local-firmwares-section w-full lg:w-80 flex-shrink-0">
+            <div className="bg-gray-800 rounded-2xl shadow-2xl p-6 border border-gray-700 h-full flex flex-col">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-semibold text-white">Local Firmwares</h2>
+                <div className="flex gap-2">
+                  <span className="px-2 py-1 bg-blue-600 text-white rounded text-xs">
+                    {displayedLocalFirmwares.length}
+                  </span>
+                  {displayedLocalFirmwares.some(f => !f.isDefault) && (
+                    <button
+                      onClick={clearAllFirmwares}
+                      disabled={isFlashing}
+                      className="px-2 py-1 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:opacity-50 text-white rounded text-xs transition-colors"
+                      title="Clear All Custom"
+                    >
+                      🗑️
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto custom-scrollbar">
+                {isLoadingDefaults ? (
+                  <div className="text-center py-8">
+                    <Loader2 className="h-8 w-8 text-blue-500 mx-auto mb-3 animate-spin" />
+                    <p className="text-gray-400 text-sm">Loading default firmwares...</p>
+                  </div>
+                ) : displayedLocalFirmwares.length === 0 ? (
+                  <div className="text-center py-8">
+                    <svg className="h-12 w-12 text-gray-600 mx-auto mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    <p className="text-gray-400 text-sm">No firmwares stored locally.</p>
+                    <p className="text-gray-500 text-xs mt-1">Default firmwares will be loaded automatically.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {displayedLocalFirmwares.map((firmware, index) => {
+                      const isDefault = firmware.isDefault;
+                      const typeClass = isDefault ? {
+                        ble: 'bg-blue-600',
+                        wifi: 'bg-green-600',
+                        serial: 'bg-purple-600'
+                      }[firmware.type || ''] : 'bg-gray-600';
+
+                      return (
+                        // ── Firmware card: pointer-events-none + dim while flashing ──
+                        <div
+                          key={index}
+                          className={`firmware-list-item border rounded-lg p-3 transition-colors
+                            ${isFlashing ? 'opacity-50 pointer-events-none' : ''}
+                            ${firmwareFile?.name === firmware.name
+                              ? 'border-green-500 bg-green-900 bg-opacity-20'
+                              : 'border-gray-600 hover:bg-gray-700'
+                            }`}
+                        >
+                          <div className="flex items-start justify-between">
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 mb-1">
+                                <p className="text-white font-medium text-sm truncate">{firmware.name}</p>
+                                {isDefault && firmware.type && (
+                                  <span className={`px-2 py-0.5 ${typeClass} text-white rounded text-xs`}>
+                                    {firmware.type.toUpperCase()}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex justify-between mt-1 text-xs text-gray-400">
+                                <span>{(firmware.size / 1024).toFixed(1)} KB</span>
+                                <span>{new Date(firmware.timestamp).toLocaleDateString()}</span>
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex gap-2 mt-2">
+                            {/* ── Load button: disabled while flashing or already selected ── */}
+                            <button
+                              onClick={() => loadFirmwareFromStorage(firmware.name)}
+                              disabled={isFlashing || firmwareFile?.name === firmware.name}
+                              className={`flex-1 px-2 py-1
+                                ${firmwareFile?.name === firmware.name
+                                  ? 'bg-green-600 cursor-default'
+                                  : 'bg-blue-600 hover:bg-blue-700 disabled:cursor-not-allowed'
+                                } text-white rounded text-xs transition-colors`}
+                            >
+                              {firmwareFile?.name === firmware.name ? 'Selected' : 'Load'}
+                            </button>
+                            {/* ── Delete button: disabled while flashing ── */}
+                            {!isDefault && (
+                              <button
+                                onClick={() => deleteFirmwareFromStorage(firmware.name)}
+                                disabled={isFlashing}
+                                className="flex-1 px-2 py-1 bg-red-600 hover:bg-red-700 disabled:cursor-not-allowed text-white rounded text-xs transition-colors"
+                              >
+                                Delete
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Quick Info */}
+              <div className="mt-4 pt-4 border-t border-gray-700">
+                {isFlashing && (
+                  <div className="mb-3 flex items-center gap-2 px-3 py-2 bg-yellow-900 bg-opacity-40 border border-yellow-700 rounded-lg">
+                    <Loader2 className="h-4 w-4 text-yellow-400 animate-spin flex-shrink-0" />
+                    <p className="text-yellow-400 text-xs font-medium">
+                      Firmware selection locked during flashing
+                    </p>
+                  </div>
+                )}
+                <div className="space-y-2 text-xs text-gray-300">
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                    <span>Loaded firmware ready</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
+                    <span>Default firmware (cannot be deleted)</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 bg-gray-500 rounded-full"></div>
+                    <span>Custom firmware</span>
+                  </div>
+                  <p className="text-gray-400 text-xs mt-2">
+                    Default firmwares are included with the app. All firmwares are stored in your browser.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Hidden file input */}
+      <input
+        type="file"
+        ref={fileInputRef}
+        onChange={handleFileUpload}
+        accept=".bin"
+        className="hidden"
+        disabled={isFlashing}
+      />
+
+      {/* Add Firmware Dialog */}
+      {showAddFirmwareDialog && !isFlashing && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full border border-gray-700">
+            <div className="border-b border-gray-700 p-4 flex justify-between items-center">
+              <h2 className="text-xl font-semibold text-white">Add Firmware</h2>
+              <button
+                onClick={() => setShowAddFirmwareDialog(false)}
+                className="text-gray-400 hover:text-white transition-colors"
+              >
+                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="p-6">
+              <div className="text-center">
+                <svg className="h-16 w-16 text-gray-400 mx-auto mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
+                </svg>
+                <p className="text-gray-300 mb-4">Select a .bin firmware file from your computer</p>
+                <button
+                  onClick={triggerFileInput}
+                  className="w-full px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
+                >
+                  Choose File
+                </button>
+                <p className="text-gray-500 text-sm mt-3">The firmware will be saved to your local storage</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* GitHub Firmware Dialog */}
+      {showGithubDialog && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-2xl w-full border border-gray-700 max-h-[80vh] flex flex-col">
+            <div className="border-b border-gray-700 p-4 flex justify-between items-center flex-shrink-0">
+              <div>
+                <h2 className="text-xl font-semibold text-white">Available Firmwares ({githubFirmwares.length})</h2>
+                <p className="text-sm text-gray-400 mt-1">Repository: {githubRepo}</p>
+              </div>
+              <button
+                onClick={() => setShowGithubDialog(false)}
+                className="text-gray-400 hover:text-white transition-colors"
+              >
+                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto flex-1 custom-scrollbar">
+              {githubFirmwares.length === 0 ? (
+                <div className="text-center py-8">
+                  <p className="text-gray-400 mb-4">No firmware files found in the latest release.</p>
+                  <button
+                    onClick={fetchGithubReleases}
+                    className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors"
+                  >
+                    Refresh
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {githubFirmwares.map((firmware, index) => {
+                    const isDownloading = downloadingFirmware === firmware.name;
+                    const isInStorage = localFirmwares.some(f => f.name === firmware.name);
+
+                    return (
+                      <div
+                        key={index}
+                        onClick={() => !isDownloading && downloadGithubFirmware(firmware.url, firmware.name)}
+                        className={`border rounded-lg p-4 cursor-pointer transition-colors ${isDownloading
+                          ? 'bg-blue-900 bg-opacity-30 border-blue-700'
+                          : isInStorage
+                            ? 'bg-green-900 bg-opacity-20 border-green-700 hover:bg-green-800'
+                            : 'border-gray-600 hover:bg-gray-700'
+                          }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-3 flex-1">
+                            {isDownloading ? (
+                              <Loader2 className="h-5 w-5 text-blue-400 animate-spin" />
+                            ) : isInStorage ? (
+                              <svg className="h-5 w-5 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                              </svg>
+                            ) : (
+                              <svg className="h-5 w-5 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
+                              </svg>
+                            )}
+                            <div className="flex-1 min-w-0">
+                              <p className="text-white font-medium truncate">{firmware.name}</p>
+                              {isDownloading && (
+                                <p className="text-sm text-blue-400 mt-1">{downloadProgress || 'Downloading...'}</p>
+                              )}
+                              {isInStorage && !isDownloading && (
+                                <p className="text-sm text-green-400 mt-1">Already in storage</p>
+                              )}
+                            </div>
+                          </div>
+                          <svg className="h-5 w-5 text-gray-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                          </svg>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      <AppTour autoStart={false} />
+    </div>
+  );
+}
