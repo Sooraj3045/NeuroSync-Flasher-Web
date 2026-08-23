@@ -1025,7 +1025,7 @@ export default function ESP32Flasher() {
           <div className="bg-gray-800 rounded-2xl shadow-2xl p-6 border border-gray-700 flex-1 flex flex-col min-h-0">
             {/* Header */}
             <div className="mb-2">
-              <h1 className="text-lg xl:text-3xl font-bold text-white ">Neuro PlayGround (NPG) Lite Firmware Flasher</h1>
+              <h1 className="text-lg xl:text-3xl font-bold text-white ">NeuroSync – Firmware Manager</h1>
             </div>
 
             {/* Connection Section */}
